@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { ContextRegistry, type Activation } from '../src/contexts.ts'
+import { ContextRegistry, peerOwnsContext, type Activation } from '../src/contexts.ts'
 import { A2AContextId, A2ATaskId } from '../src/protocol/brand.ts'
 import { createSlot } from '../src/tasks.ts'
 
@@ -106,5 +106,36 @@ describe('drain', () => {
     registry.add(activation('b', 'bob', 5000))
     expect(registry.drain()).toHaveLength(2)
     expect(registry.size).toBe(0)
+  })
+})
+
+/**
+ * Resumption happens long after the registry forgot the context, so ownership
+ * is re-proven from the context's own durable log. This predicate is the whole
+ * of that decision: everything it rejects is answered with a fresh context.
+ */
+describe('recorded ownership', () => {
+  it('accepts the single peer the log records', () => {
+    expect(peerOwnsContext(new Set(['alice']), 'alice')).toBe(true)
+  })
+
+  it("rejects a peer the log does not name", () => {
+    expect(peerOwnsContext(new Set(['alice']), 'bob')).toBe(false)
+  })
+
+  it('rejects a context that served more than one peer', () => {
+    expect(peerOwnsContext(new Set(['alice', 'bob']), 'alice')).toBe(false)
+  })
+
+  it('rejects an empty log, which proves nothing', () => {
+    expect(peerOwnsContext(new Set(), 'alice')).toBe(false)
+  })
+
+  it('rejects an unreadable log rather than assuming ownership', () => {
+    expect(peerOwnsContext(undefined, 'alice')).toBe(false)
+  })
+
+  it('is not fooled by a peer identity that merely looks similar', () => {
+    expect(peerOwnsContext(new Set(['alice2']), 'alice')).toBe(false)
   })
 })

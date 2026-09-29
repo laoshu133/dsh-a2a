@@ -46,7 +46,7 @@ import {
   type A2ATaskState,
 } from './protocol/index.ts'
 import type { A2AServerConfig } from './config.ts'
-import type { Activation, ContextRegistry } from './contexts.ts'
+import type { Activation, ContextAuditRow, ContextRegistry } from './contexts.ts'
 import { filterInbound, redactOutbound, type PeerIdentity, type RateLimiter, type TurnTracker } from './security.ts'
 import type { TaskSlot, TaskSettlement } from './tasks.ts'
 
@@ -70,6 +70,22 @@ export interface RouterDeps {
   /** The authenticated extended card, or undefined when none is configured. */
   extendedCardFor: (hostHeader: string | undefined) => A2AAgentCard | undefined
   createActivation: (peer: PeerIdentity) => Promise<Activation>
+  /**
+   * Re-attach a peer to a context this process no longer holds resident.
+   *
+   * `contextId` IS the session id and the durable Session outlives the registry,
+   * so a context forgotten by a restart or an idle eviction is resumed instead of
+   * being silently replaced. Resolves to undefined whenever it cannot be resumed
+   * — the session is gone, persistence is not composed, or the durable log does
+   * not prove this peer owns it — and the caller then starts a fresh context.
+   */
+  resumeActivation: (rawContextId: string, peer: PeerIdentity) => Promise<Activation | undefined>
+  /**
+   * Record how one request's `contextId` resolved.
+   *
+   * Diagnostics only: never throws, and never changes the answer.
+   */
+  audit: (row: ContextAuditRow) => void
   submit: (activation: Activation, text: string, peer: PeerIdentity) => Promise<TaskSlot>
   cancel: (activation: Activation, slot: TaskSlot) => void
   taskSnapshot: (
@@ -297,30 +313,64 @@ export function createRouter(deps: RouterDeps): Router {
    * Resolve the context a request addresses, creating one when none was named.
    *
    * A context owned by another peer is reported exactly as an absent one, so a
-   * peer cannot enumerate context ids by comparing responses.
+   * peer cannot enumerate context ids by comparing responses — and it is never
+   * resumed, because one peer must not be handed another's conversation.
+   *
+   * Every branch reports its outcome through `deps.audit`: a forgotten context
+   * and an omitted one produce the same task on the wire, so nothing else
+   * distinguishes an integration that stopped sending its id from a process
+   * that lost it.
    */
   const resolveContext = async (
     rawContextId: string | undefined,
     peer: PeerIdentity,
   ): Promise<Activation> => {
-    if (rawContextId === undefined) return deps.createActivation(peer)
+    if (rawContextId === undefined) {
+      const created = await deps.createActivation(peer)
+      deps.audit({ peer, presented: false, outcome: 'created', newContextId: created.contextId })
+      return created
+    }
     const found = deps.contexts.lookup(A2AContextId(rawContextId), peer)
-    if (found === 'unknown') {
-      // The registry is process-local: a restart, idle eviction, or a
-      // workspace relocation forgets every context. A peer that reuses a
-      // contextId (exactly what A2A conversation continuity encourages)
-      // would otherwise hit a hard error it cannot recover from — it has no
-      // way to know the server forgot. Fall back to a fresh context, which
-      // is what the peer would have gotten by omitting contextId anyway.
-      return deps.createActivation(peer)
-    }
     if (found === 'forbidden') {
-      // Owned by another peer: report exactly as absent (anti-enumeration),
-      // but DO create a fresh context rather than hard-failing — the peer
-      // cannot tell the difference and the outcome is the same useful one.
-      return deps.createActivation(peer)
+      const created = await deps.createActivation(peer)
+      deps.audit({
+        peer,
+        presented: true,
+        contextId: rawContextId,
+        outcome: 'created-foreign',
+        newContextId: created.contextId,
+      })
+      return created
     }
-    return found
+    if (found !== 'unknown') {
+      deps.audit({ peer, presented: true, contextId: rawContextId, outcome: 'resident' })
+      return found
+    }
+    // The registry is process-local: a restart or an idle eviction forgets
+    // every context while its durable Session survives. A peer that reuses a
+    // contextId — exactly what A2A conversation continuity encourages — is
+    // entitled to that conversation back rather than to a silent replacement.
+    const resumed = await deps.resumeActivation(rawContextId, peer)
+    if (resumed !== undefined) {
+      deps.audit({ peer, presented: true, contextId: rawContextId, outcome: 'resumed' })
+      return resumed
+    }
+    // Genuinely gone, or owned by a peer that cannot be proven. A fresh context
+    // still answers — a peer that can never send again is worse than one that
+    // gets a new conversation — but loudly, because this is the outcome an
+    // operator needs to see when continuity was expected.
+    const created = await deps.createActivation(peer)
+    deps.logger.warn(
+      `a2a: context ${rawContextId} could not be resumed for ${peer}; started ${created.contextId}`,
+    )
+    deps.audit({
+      peer,
+      presented: true,
+      contextId: rawContextId,
+      outcome: 'created-unresumable',
+      newContextId: created.contextId,
+    })
+    return created
   }
 
   /**

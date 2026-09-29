@@ -220,6 +220,7 @@ part 是被**删除**而不是做了别名：本服务写出的每一个回包�
 | `blockTimeoutMs` | `60000` | 超过后拒绝继续阻塞 |
 | `contextIdleTtlMs` | `1800000` | context 的 agent 被释放前的空闲时长 |
 | `maxResidentContexts` | `64` | 常驻 context 数量上限 |
+| `contextAuditPath` | `$DSH_HOME/a2a-context-audit.jsonl` | 每条入站消息一行 JSON：peer、是否携带 `contextId`、以及最终如何解析。置空字符串则关闭 |
 | `isolation.workspaceMode` | `per-peer` | `per-peer` 或 `shared` |
 | `isolation.workspaceRoot` | — | 必填；父目录或共享 cwd |
 | `isolation.peerWorkspaces` | `{}` | 按身份覆盖工作目录 |
@@ -228,6 +229,28 @@ part 是被**删除**而不是做了别名：本服务写出的每一个回包�
 以下情况在加载期即被拒绝：缺少 `isolation.workspaceRoot`；peer 名不匹配
 `[A-Za-z0-9][A-Za-z0-9_-]*`；`tokenEnv` 不是 POSIX 标识符；`trustedPeers` 或
 `peerWorkspaces` 引用了未声明的 peer；`basePath` 不以 `/` 开头。
+
+### 对话连续性
+
+`contextId` 是对话的键，是否连续由 **peer** 决定：不传就新建 context，传回来就
+接着聊。但保存常驻 context 的注册表是进程内的，所以被空闲回收或重启遗忘的
+context 会通过恢复其持久化 Session 找回——`contextId` **本身**就是 session id，
+且重新接管之前会从该 session 自己的日志里读取 `a2a/task` 行来核对归属。
+
+无法恢复的 context——属于其他 peer、组合中未挂载持久化、或 session 确实已删除
+——依然会拿到一个全新 context，而不是让这次发送失败：一个永远发不出消息的 peer
+比一个拿到新对话的 peer 更糟。每种结果都会在 `contextAuditPath` 留下恰好一行
+JSON，这正是区分"peer 没把 `contextId` 传回来"与"服务端把 context 弄丢了"的
+依据：
+
+```json
+{"time":"…","peer":"alice","presented":true,"contextId":"9bd752eb-…","outcome":"resumed"}
+{"time":"…","peer":"alice","presented":true,"contextId":"e38b9b44-…","outcome":"created-unresumable","newContextId":"9bd752eb-…"}
+{"time":"…","peer":"alice","presented":false,"outcome":"created","newContextId":"9bd752eb-…"}
+```
+
+`resident` 与 `resumed` 表示 peer 保住了原来的对话；两种 `created-*` 表示它拿到了
+新对话，而只有 `presented:false` 才把原因归到 peer 一侧。
 
 ### 凭据
 

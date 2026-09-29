@@ -10,6 +10,8 @@
  * @module dsh-a2a/config
  */
 
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import Schema from '@deepseek-ai/schemastery'
 
 /** A credential reference name: the shape `ctx.credentials` addresses. */
@@ -17,6 +19,17 @@ const CREDENTIAL_REF = /^[A-Za-z_][A-Za-z0-9_]*$/
 
 /** A peer name: also the workspace directory component, so no separators. */
 const PEER_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]*$/
+
+/**
+ * Where context-resolution audit lines go when the deployment names no path.
+ *
+ * The audit answers a question nothing else on the wire can — "did this peer
+ * stop sending its contextId, or did the server forget the context?" — so it
+ * belongs with the deployment's own state rather than in the working directory
+ * of whoever happened to start the process.
+ */
+export const DEFAULT_CONTEXT_AUDIT_PATH =
+  join(process.env['DSH_HOME'] ?? join(homedir(), '.dsh'), 'a2a-context-audit.jsonl')
 
 /** One authenticated peer and where its credential lives. */
 export interface PeerConfig {
@@ -113,6 +126,11 @@ export interface A2AServerConfig {
   blockTimeoutMs: number
   contextIdleTtlMs: number
   maxResidentContexts: number
+  /**
+   * Where one context-resolution audit line per inbound message is appended, as
+   * JSON Lines. An empty string disables the audit entirely.
+   */
+  contextAuditPath: string
   isolation: IsolationConfig
   push: PushConfig
 }
@@ -171,6 +189,10 @@ export const Config: Schema<A2AServerConfig> = Schema.object({
   blockTimeoutMs: Schema.natural().default(60_000),
   contextIdleTtlMs: Schema.natural().default(1_800_000),
   maxResidentContexts: Schema.natural().default(64),
+  // Defaulted rather than required: the audit is a diagnostic, and a deployment
+  // that never reads it should not have to name a path. Empty disables it, which
+  // is how a deployment that would rather not write a file at all says so.
+  contextAuditPath: Schema.string().default(DEFAULT_CONTEXT_AUDIT_PATH),
 
   isolation: Schema.object({
     workspaceMode: Schema.union(['per-peer', 'shared'] as const).default('per-peer'),

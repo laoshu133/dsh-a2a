@@ -34,6 +34,57 @@ export interface Activation {
 /** Why a context lookup did not produce an Activation. */
 export type LookupFailure = 'unknown' | 'forbidden'
 
+/**
+ * Whether a peer provably owns the context it is asking to resume.
+ *
+ * Ownership is read back from the context's own durable log rather than from a
+ * side table, because a table that lives only in this process dies with this
+ * process — the exact case resumption exists to survive. A log naming no peer,
+ * or more than one, proves nothing: an unprovable owner is not a proven one,
+ * and resuming on a guess would hand one peer another peer's conversation.
+ * @param owners - every peer recorded in the context's log, or undefined when that log cannot be read.
+ * @param peer - the authenticated identity asking to resume.
+ * @returns true only when exactly one peer is recorded and that peer is this one.
+ */
+export function peerOwnsContext(owners: ReadonlySet<string> | undefined, peer: string): boolean {
+  return owners !== undefined && owners.size === 1 && owners.has(peer)
+}
+
+/** How one inbound message's `contextId` resolved. */
+export type ContextResolutionOutcome =
+  /** No `contextId` was presented, so a new context was started. */
+  | 'created'
+  /** The presented context was resident and belongs to this peer. */
+  | 'resident'
+  /** The presented context was not resident but was resumed from its durable Session. */
+  | 'resumed'
+  /** The presented context belongs to another peer; a new one was started. */
+  | 'created-foreign'
+  /** The presented context could not be resumed; a new one was started. */
+  | 'created-unresumable'
+
+/**
+ * One line of context-resolution audit, written per inbound message.
+ *
+ * Every fallback above produces the SAME task on the wire as a peer that sent
+ * no contextId at all, so neither the peer nor an operator can tell "the
+ * integration stopped sending its id" from "this process forgot the context"
+ * by looking at the response. That question is asked of every A2A integration
+ * eventually, so it is recorded rather than inferred.
+ */
+export interface ContextAuditRow {
+  /** The authenticated peer this message came from. */
+  peer: string
+  /** Whether the peer presented a `contextId` at all. */
+  presented: boolean
+  /** The id the peer presented, when it presented one. */
+  contextId?: string
+  /** How that resolution ended. */
+  outcome: ContextResolutionOutcome
+  /** The context the message actually ran in, when this request created one. */
+  newContextId?: string
+}
+
 /** Registry of resident contexts with LRU + idle eviction. */
 export class ContextRegistry {
   private readonly activations = new Map<A2AContextId, Activation>()

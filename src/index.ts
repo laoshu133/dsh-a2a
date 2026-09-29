@@ -19,11 +19,11 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { mkdir, access } from 'node:fs/promises'
+import { mkdir, access, appendFile } from 'node:fs/promises'
 import { constants } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import {
@@ -39,7 +39,7 @@ import {
 } from './protocol/index.ts'
 import { assertConfigCoherent, Config, type A2AServerConfig } from './config.ts'
 import { SERVER_VERSION } from './version.ts'
-import { ContextRegistry, type Activation } from './contexts.ts'
+import { ContextRegistry, peerOwnsContext, type Activation, type ContextAuditRow } from './contexts.ts'
 import { identifyPeer, RateLimiter, TurnTracker, type PeerIdentity } from './security.ts'
 import { artifactsFromTexts, createSlot, stateFromEnding, type TaskSlot } from './tasks.ts'
 import { createRouter, type RouterDeps } from './router.ts'
@@ -94,6 +94,28 @@ export function apply(ctx: Context, config: A2AServerConfig): void {
   const contexts = new ContextRegistry(config.maxResidentContexts, config.contextIdleTtlMs)
   const rateLimiter = new RateLimiter(config.rateLimitPerMinute)
   const turns = new TurnTracker()
+
+  /**
+   * Append one context-resolution audit line.
+   *
+   * A2A continuity lives entirely in the `contextId` a peer chooses to send
+   * back, and this registry is process-local — so from the response alone "the
+   * peer never sent one" and "this process forgot the context" are
+   * indistinguishable. That distinction is the first question every peer
+   * integration ends up asking, so it is recorded rather than inferred.
+   *
+   * Never fatal and never awaited: a failed audit write costs a diagnostic, not
+   * an answer, and a peer must not wait on a file this deployment may not even
+   * be able to write.
+   */
+  const audit = (row: ContextAuditRow): void => {
+    if (config.contextAuditPath.length === 0) return
+    void appendFile(config.contextAuditPath, `${JSON.stringify({ time: nowIso(), ...row })}\n`)
+      .catch((error: unknown) => {
+        logger.warn(`a2a: could not append the context audit line: ${String(error)}`)
+      })
+  }
+
   let closed = false
 
   /** Reject a request that arrives while teardown is in progress. */
@@ -331,6 +353,36 @@ export function apply(ctx: Context, config: A2AServerConfig): void {
 
   // ── Context materialization ────────────────────────────────────────────
   /**
+   * Adopt one context into the resident registry.
+   *
+   * Creating and resuming differ only in whether a durable Session was reused,
+   * so both build the Activation here rather than letting two shapes drift.
+   * @param contextId - the id the peer will keep addressing this context by.
+   * @param handle - the live agent handle owning the Session.
+   * @param peer - the authenticated identity that owns the context.
+   * @param cwd - the working directory the agent runs in.
+   * @returns the registered Activation.
+   */
+  const registerActivation = (
+    contextId: A2AContextId,
+    handle: AgentHandle,
+    peer: PeerIdentity,
+    cwd: string,
+  ): Activation => {
+    const activation: Activation = {
+      contextId,
+      agent: handle.agent,
+      handle,
+      peer,
+      cwd,
+      slots: new Map(),
+      lastTouchedAt: Date.now(),
+    }
+    contexts.add(activation)
+    return activation
+  }
+
+  /**
    * Create a fresh context and its owning agent.
    *
    * The policy events written onto the child's own log are what make an
@@ -356,15 +408,6 @@ export function apply(ctx: Context, config: A2AServerConfig): void {
       await handle.dispose()
       throw new Error('server closed during context creation')
     }
-    const activation: Activation = {
-      contextId: A2AContextId(sessionId),
-      agent: handle.agent,
-      handle,
-      peer,
-      cwd,
-      slots: new Map(),
-      lastTouchedAt: Date.now(),
-    }
     // Pin the approval policy on the agent's OWN log so its effective policy
     // stays reconstructable from that log alone — the same discipline
     // `captureDelegatedPolicyOverrides` applies to a delegated child. Nobody
@@ -382,8 +425,7 @@ export function apply(ctx: Context, config: A2AServerConfig): void {
     } catch (error: unknown) {
       logger.warn(`a2a: could not pin approval policy: ${String(error)}`)
     }
-    contexts.add(activation)
-    return activation
+    return registerActivation(A2AContextId(sessionId), handle, peer, cwd)
   }
 
   // ── Durable task read model ────────────────────────────────────────────
@@ -404,6 +446,66 @@ export function apply(ctx: Context, config: A2AServerConfig): void {
       'a2a: no sessionProjections registry composed; GetTask cannot answer '
       + 'once a task settles, so a polling peer will never learn its result',
     )
+  }
+
+  /**
+   * Every peer that wrote a task into this context, if it can be proven.
+   *
+   * Ownership is read back from the Session's own log — `a2a/task` rows carry
+   * the peer that submitted them — so it survives an eviction or a restart
+   * without a side table that would die with the process. `undefined` means
+   * "not provable", which {@link peerOwnsContext} treats as foreign.
+   * @param session - the resumed Session to read.
+   * @returns the distinct recorded peers, or undefined without a projection registry.
+   */
+  const recordedPeers = (session: Agent['session']): ReadonlySet<string> | undefined => {
+    if (projections === undefined) return undefined
+    const rows = projections.snapshot(session).values.a2aTask?.tasks ?? {}
+    return new Set(Object.values(rows).map(row => row.peer))
+  }
+
+  /**
+   * Re-attach a peer to a context this process no longer holds resident.
+   *
+   * `contextId` IS the session id, and the durable Session outlives the
+   * registry, so a context the idle reaper or a restart forgot is resumed
+   * rather than silently replaced by a fresh conversation — which is what the
+   * residency policy always claimed and what a peer that stores its contextId
+   * is entitled to expect.
+   *
+   * Ownership is re-proven from the resumed Session's own log before the peer
+   * is re-attached: a context id must never let one peer continue another's
+   * conversation, and an unprovable owner is not a proven one.
+   * @param rawContextId - the id the peer presented.
+   * @param peer - the authenticated identity asking to resume it.
+   * @returns the resumed Activation, or undefined when it cannot be resumed.
+   */
+  const resumeActivation = async (
+    rawContextId: string,
+    peer: PeerIdentity,
+  ): Promise<Activation | undefined> => {
+    // `agents.resume` requires persistence, and a composition without it is a
+    // fact about the deployment rather than an error the peer caused.
+    if (ctx.get('sessionPersistence') === undefined) return undefined
+    let handle: AgentHandle
+    try {
+      handle = await agents.resume({ resumeSessionId: SessionId(rawContextId) })
+    } catch (error: unknown) {
+      logger.warn(`a2a: could not resume context ${rawContextId}: ${String(error)}`)
+      return undefined
+    }
+    if (closed) {
+      // Same orphan hazard as createActivation: teardown began while resume()
+      // was awaited, so nothing else will ever release this handle.
+      await handle.dispose()
+      return undefined
+    }
+    if (!peerOwnsContext(recordedPeers(handle.agent.session), peer)) {
+      await handle.dispose()
+      return undefined
+    }
+    const cwd = handle.agent.session.header.cwd ?? workspaceFor(peer)
+    return registerActivation(A2AContextId(rawContextId), handle, peer, cwd)
   }
 
   /**
@@ -480,6 +582,8 @@ export function apply(ctx: Context, config: A2AServerConfig): void {
     cardFor,
     extendedCardFor,
     createActivation,
+    resumeActivation,
+    audit,
     submit: async (activation, text, peer) => {
       const liveAgent = ctx.agents.get(activation.agent.id)
       if (liveAgent !== activation.agent) {

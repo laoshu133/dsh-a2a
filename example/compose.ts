@@ -11,6 +11,7 @@
  * @module dsh-a2a/example/compose
  */
 
+import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
@@ -53,6 +54,14 @@ export interface ComposeOptions {
   trustedPeers?: string[]
   /** Cap on turns per context before rejection. */
   maxContextTurns?: number
+  /**
+   * Where context-resolution audit lines are appended.
+   *
+   * Defaults to a file beside this composition's own workspaces rather than to
+   * the plugin's `$DSH_HOME` default, so that a test — or a demo run — never
+   * appends to the audit of a real deployment on the same machine.
+   */
+  contextAuditPath?: string
   /** Whether `SendMessage` waits for the terminal state. */
   sendMode?: 'block' | 'immediate'
   /** How long a blocking send waits before handing back a non-terminal task. */
@@ -157,6 +166,7 @@ export async function compose(options: ComposeOptions): Promise<Composition> {
     blockTimeoutMs: options.blockTimeoutMs ?? 15_000,
     contextIdleTtlMs: 1_800_000,
     maxResidentContexts: 64,
+    contextAuditPath: options.contextAuditPath ?? join(options.workspaceRoot, 'a2a-context-audit.jsonl'),
     isolation: {
       workspaceMode: options.workspaceMode ?? 'per-peer',
       workspaceRoot: options.workspaceRoot,

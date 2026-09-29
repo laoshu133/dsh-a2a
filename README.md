@@ -233,6 +233,7 @@ another peer answers exactly as an absent one.
 | `blockTimeoutMs` | `60000` | After which a blocking request is declined |
 | `contextIdleTtlMs` | `1800000` | Idle time before a context's agent is released |
 | `maxResidentContexts` | `64` | Ceiling on resident contexts |
+| `contextAuditPath` | `$DSH_HOME/a2a-context-audit.jsonl` | One JSON line per message: peer, whether a `contextId` was presented, and how it resolved. Empty string disables |
 | `isolation.workspaceMode` | `per-peer` | `per-peer` or `shared` |
 | `isolation.workspaceRoot` | — | Required; parent directory or shared cwd |
 | `isolation.peerWorkspaces` | `{}` | Per-identity working-directory override |
@@ -242,6 +243,32 @@ Configuration is refused at load when `isolation.workspaceRoot` is absent, a pee
 name is not `[A-Za-z0-9][A-Za-z0-9_-]*`, a `tokenEnv` is not a POSIX identifier,
 `trustedPeers` or `peerWorkspaces` names an undeclared peer, or `basePath` does
 not start with `/`.
+
+### Conversation continuity
+
+`contextId` is the conversation key, and continuity is the **peer's** choice:
+omit it and the server starts a context, send it back and the conversation
+continues. The registry holding resident contexts is process-local, so a context
+the idle reaper or a restart forgot is recovered by resuming its durable
+Session — `contextId` *is* the session id, and ownership is re-read from the
+`a2a/task` rows in that session's own log before the peer is re-attached.
+
+A context that cannot be resumed — another peer owns it, persistence is not
+composed, or the session is genuinely gone — still gets a fresh context rather
+than a failed send, because a peer that can never send again is worse than a peer
+that gets a new conversation. Every outcome is one JSON line in
+`contextAuditPath`, which is what tells a peer integration that never sends its
+`contextId` back apart from a server that lost it:
+
+```json
+{"time":"…","peer":"alice","presented":true,"contextId":"9bd752eb-…","outcome":"resumed"}
+{"time":"…","peer":"alice","presented":true,"contextId":"e38b9b44-…","outcome":"created-unresumable","newContextId":"9bd752eb-…"}
+{"time":"…","peer":"alice","presented":false,"outcome":"created","newContextId":"9bd752eb-…"}
+```
+
+`resident` and `resumed` mean the peer kept its conversation; the two
+`created-*` outcomes mean it was handed a new one, and only `presented:false`
+puts the cause on the peer's side.
 
 ### Credentials
 
