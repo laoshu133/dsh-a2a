@@ -24,7 +24,9 @@
           # directory, which also makes the cwd-equality authority in
           # cross-session tooling separate peers for free. A deployment whose
           # peers collaborate on one repository must say so explicitly.
+          # Literal path, not a JS expression: the host's YAML loader does not
+          # resolve JS-tagged scalars, and that failure skips the whole plugin.
           workspaceMode: per-peer
-          workspaceRoot: !!js `${process.env.DSH_HOME ?? process.env.HOME}/a2a-workspaces`
+          workspaceRoot: /tmp/a2a-workspaces
         push:
           enabled: false
