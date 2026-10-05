@@ -101,6 +101,8 @@ interface StreamChannel {
   id: string | number | null
   taskId: A2ATaskId
   contextId: string
+  /** Interval keeping the SSE connection warm while a task runs long. */
+  heartbeat: ReturnType<typeof setInterval>
 }
 
 /** The router surface the plugin body wires into routes and teardown. */
@@ -119,6 +121,10 @@ export interface Router {
 export function createRouter(deps: RouterDeps): Router {
   const { config } = deps
   const streams = new Set<StreamChannel>()
+  // How often an open stream gets a `: ping` comment while its task runs.
+  // 15s sits comfortably under the ~30-60s idle window where proxies and the
+  // DingTalk caller drop a silent SSE connection.
+  const STREAM_HEARTBEAT_MS = 15_000
 
   const sendJson = (res: ServerResponse, status: number, body: unknown): void => {
     const text = JSON.stringify(body)
@@ -662,6 +668,19 @@ export function createRouter(deps: RouterDeps): Router {
     })
     const channel: StreamChannel = {
       res, id, taskId: slot.taskId, contextId: activation.contextId,
+      // A long task leaves the stream silent between the opening Task frame and
+      // settlement — and an idle SSE connection is exactly what proxies and the
+      // DingTalk caller time out on, surfacing as "数字员工离线" while the
+      // agent is still working. SSE comment lines are protocol-invisible to a
+      // conformant client, so a periodic heartbeat keeps the connection warm
+      // without touching the event stream's semantics.
+      heartbeat: setInterval(() => {
+        try {
+          res.write(': ping\n\n')
+        } catch {
+          // A socket already gone clears itself on the next settled/close path.
+        }
+      }, STREAM_HEARTBEAT_MS),
     }
     streams.add(channel)
 
@@ -671,6 +690,7 @@ export function createRouter(deps: RouterDeps): Router {
 
     void slot.settled.then((settlement: TaskSettlement) => {
       if (!streams.has(channel)) return
+      clearInterval(channel.heartbeat)
       const artifacts = redactArtifacts(settlement.artifacts)
       artifacts.forEach((artifact, index) => {
         res.write(sseFrame(id, streamArtifactUpdate({
@@ -714,6 +734,7 @@ export function createRouter(deps: RouterDeps): Router {
 
   const closeStreams = (): void => {
     for (const channel of streams) {
+      clearInterval(channel.heartbeat)
       try {
         channel.res.write(sseFrame(channel.id, streamStatusUpdate({
           taskId: channel.taskId,
