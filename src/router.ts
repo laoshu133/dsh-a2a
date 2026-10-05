@@ -657,7 +657,8 @@ export function createRouter(deps: RouterDeps): Router {
 
     void slot.settled.then((settlement: TaskSettlement) => {
       if (!streams.has(channel)) return
-      redactArtifacts(settlement.artifacts).forEach((artifact, index) => {
+      const artifacts = redactArtifacts(settlement.artifacts)
+      artifacts.forEach((artifact, index) => {
         res.write(sseFrame(id, streamArtifactUpdate({
           taskId: slot.taskId,
           contextId: activation.contextId,
@@ -666,10 +667,29 @@ export function createRouter(deps: RouterDeps): Router {
           lastChunk: true,
         })))
       })
+      // Compatibility: some A2A clients (e.g. the DingTalk-side caller) read
+      // only the terminal statusUpdate frame and never the artifactUpdate
+      // frames, then report the reply as unrecognizable because that frame
+      // carries no text. The v1.0 statusUpdate event has no artifacts field,
+      // but its free-form metadata may carry the settled output and artifacts
+      // so such clients can still find the reply. Standard clients keep
+      // reading artifactUpdate and are unaffected.
+      const output = settlement.artifacts
+        .flatMap(a => a.parts)
+        .map(p => ('text' in p && typeof p.text === 'string') ? p.text : '')
+        .filter(text => text.length > 0)
+        .join('\n')
       res.write(sseFrame(id, streamStatusUpdate({
         taskId: slot.taskId,
         contextId: activation.contextId,
         status: { state: settlement.state, timestamp: nowIso() },
+        metadata: {
+          dsh: {
+            ...settlement.stopReason === undefined ? {} : { stopReason: settlement.stopReason },
+            ...output.length === 0 ? {} : { output },
+            ...artifacts.length === 0 ? {} : { artifacts },
+          },
+        },
       })))
       streams.delete(channel)
       // v1.0 dropped the `final` flag: closing the stream IS the terminal
