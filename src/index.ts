@@ -23,7 +23,7 @@ import { mkdir, access } from 'node:fs/promises'
 import { constants } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import {
@@ -357,19 +357,50 @@ export function apply(ctx: Context, config: A2AServerConfig): void {
    * rejected rather than waiting on a prompt nobody is watching, and the policy
    * stays reconstructable from that log alone.
    */
-  const createActivation = async (peer: PeerIdentity): Promise<Activation> => {
+  const createActivation = async (
+    peer: PeerIdentity,
+    contextId?: A2AContextId,
+  ): Promise<Activation> => {
     const cwd = workspaceFor(peer)
     await ensureWorkspace(cwd)
-    const sessionId = SessionId(randomUUID())
-    const handle = await agents.create({
-      sessionId,
-      meta: { cwd },
-      agentOptions: {
-        ...config.provider === undefined ? {} : { provider: config.provider },
-        ...config.model === undefined ? {} : { model: config.model },
-      },
-      setup: mountAgentPreset,
-    })
+    const agentOptions = {
+      ...config.provider === undefined ? {} : { provider: config.provider },
+      ...config.model === undefined ? {} : { model: config.model },
+    }
+    let handle: AgentHandle
+    if (contextId === undefined) {
+      handle = await agents.create({
+        sessionId: SessionId(randomUUID()),
+        meta: { cwd },
+        agentOptions,
+        setup: mountAgentPreset,
+      })
+    } else {
+      // The caller presented a contextId (its A2A conversation identity). The
+      // durable session for it usually still exists on disk across a restart,
+      // so RESUME it — never agents.create, which rejects the id as a duplicate
+      // (SessionAlreadyExistsError) and surfaced at the DingTalk caller as an
+      // unparseable reply. If no durable session exists, fall back to a fresh
+      // session so the resume policy is "never hard-fail".
+      try {
+        handle = await agents.resume({
+          resumeSessionId: SessionId(contextId),
+          agentOptions,
+          setup: mountAgentPreset,
+        })
+      } catch (error: unknown) {
+        logger.warn(
+          `a2a: resume of context ${contextId} failed (${String(error)}); `
+          + 'starting a fresh session under the same contextId',
+        )
+        handle = await agents.create({
+          sessionId: SessionId(randomUUID()),
+          meta: { cwd },
+          agentOptions,
+          setup: mountAgentPreset,
+        })
+      }
+    }
     if (closed) {
       // Teardown can begin while create() is awaited. Such an agent is not in
       // the registry and quiesce() would never release it — the classic orphan.
@@ -377,7 +408,10 @@ export function apply(ctx: Context, config: A2AServerConfig): void {
       throw new Error('server closed during context creation')
     }
     const activation: Activation = {
-      contextId: A2AContextId(sessionId),
+      // The A2A-facing contextId is always the caller-presented one when given,
+      // so the caller's NEXT message resolves here even if we fell back to a
+      // fresh session whose own id differs.
+      contextId: contextId ?? A2AContextId(handle.agent.session.id),
       agent: handle.agent,
       handle,
       peer,

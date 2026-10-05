@@ -69,7 +69,7 @@ export interface RouterDeps {
   cardFor: (hostHeader: string | undefined) => A2AAgentCard
   /** The authenticated extended card, or undefined when none is configured. */
   extendedCardFor: (hostHeader: string | undefined) => A2AAgentCard | undefined
-  createActivation: (peer: PeerIdentity) => Promise<Activation>
+  createActivation: (peer: PeerIdentity, contextId?: A2AContextId) => Promise<Activation>
   submit: (activation: Activation, text: string, peer: PeerIdentity) => Promise<TaskSlot>
   cancel: (activation: Activation, slot: TaskSlot) => void
   taskSnapshot: (
@@ -305,10 +305,24 @@ export function createRouter(deps: RouterDeps): Router {
   ): Promise<Activation> => {
     if (rawContextId === undefined) return deps.createActivation(peer)
     const found = deps.contexts.lookup(A2AContextId(rawContextId), peer)
-    if (found === 'unknown' || found === 'forbidden') {
+    if (found === 'forbidden') {
+      // Another peer owns this id: refuse, and answer exactly as 'unknown'
+      // would have before this fallback existed — never reveal which ids live.
       throw new A2ARpcError(ERR_INVALID_PARAMS, `unknown contextId: ${rawContextId}`)
     }
-    return found
+    if (found !== 'unknown') return found
+    // The peer presented a contextId this process no longer holds — most often
+    // a context created before a restart (the registry is in-memory). Hard
+    // errors here surface at the caller as an unparseable reply: the DingTalk
+    // AI-assistant caller reuses one contextId across restarts and reports the
+    // JSON-RPC error as "子智能体返回的内容无法识别". Policy is to never
+    // hard-fail a resume: create a fresh context under the SAME id so the
+    // caller's next message lands on it, trading lost history for a reply.
+    deps.logger.warn(
+      `a2a: contextId ${rawContextId} not resident (likely a restart); `
+      + `creating a fresh context under the same id for peer ${peer}`,
+    )
+    return deps.createActivation(peer, A2AContextId(rawContextId))
   }
 
   /**
