@@ -331,6 +331,25 @@ export function apply(ctx: Context, config: A2AServerConfig): void {
 
   // ── Context materialization ────────────────────────────────────────────
   /**
+   * Agent setup mounting the configured agent preset onto an A2A-owned agent.
+   *
+   * Without this an A2A agent is bare: the GUI's session controller composes
+   * every interactive agent with a preset (tools, skills, persona), but a
+   * programmatic `agents.create()` receives none, which is why A2A sessions
+   * used to announce they had no shell, web, or filesystem access. Probing
+   * `ctx.get('agentPresets')` keeps the optional-capability doctrine: a
+   * composition without the registry still boots and serves, just bare. A
+   * mount failure (e.g. a preset id the registry rejects) is a configuration
+   * error worth surfacing, so it fails the create rather than silently
+   * degrading the agent.
+   */
+  const mountAgentPreset = async (agentCtx: Context): Promise<void> => {
+    const presets = ctx.get('agentPresets')
+    if (presets === undefined) return
+    await presets.mount(agentCtx, config.agentPreset)
+  }
+
+  /**
    * Create a fresh context and its owning agent.
    *
    * The policy events written onto the child's own log are what make an
@@ -349,6 +368,7 @@ export function apply(ctx: Context, config: A2AServerConfig): void {
         ...config.provider === undefined ? {} : { provider: config.provider },
         ...config.model === undefined ? {} : { model: config.model },
       },
+      setup: mountAgentPreset,
     })
     if (closed) {
       // Teardown can begin while create() is awaited. Such an agent is not in

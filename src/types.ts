@@ -14,7 +14,30 @@
  * @module dsh-a2a/types
  */
 
+import type { Context } from '@deepseek-ai/cordis'
 import type { A2ATaskId, A2ATaskState } from './protocol/index.ts'
+
+/**
+ * The one `agentPresets` method this plugin calls, declared structurally.
+ *
+ * The web composition's preset registry (`@deepseek-ai/dsh-agent-preset-registry`)
+ * supplies the real service at runtime; declaring the seam here keeps this
+ * package free of a dependency whose own type surface targets a newer cordis
+ * than this plugin compiles against. Mounting gives an A2A-created agent the
+ * same tools, skills, and persona an interactive GUI session receives — the
+ * difference between "当前会话没有 shell、Web 抓取和本地文件系统读写工具" and
+ * an agent that can actually work.
+ */
+export interface AgentPresetMount {
+  mount(ctx: Context, id?: string): Promise<unknown>
+}
+
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    /** Optional: present only in compositions that mount a preset registry. */
+    agentPresets?: AgentPresetMount
+  }
+}
 
 declare module '@deepseek-ai/dsh-session/types' {
   interface SessionEventMap {

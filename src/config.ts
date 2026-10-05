@@ -104,6 +104,13 @@ export interface A2AServerConfig {
   provider?: string
   /** Model for every agent this server creates. */
   model?: string
+  /**
+   * Agent preset mounted onto every agent this server creates, e.g. the web
+   * composition's `standard` (tools, skills, persona). Optional: a composition
+   * without an `agentPresets` registry keeps booting with a bare agent, and an
+   * unset value mounts the registry's own default.
+   */
+  agentPreset?: string
   card: CardConfig
   peers: Record<string, PeerConfig>
   trustedPeers?: string[]
@@ -134,6 +141,7 @@ export const Config: Schema<A2AServerConfig> = Schema.object({
   publicUrl: Schema.string(),
   provider: Schema.string(),
   model: Schema.string(),
+  agentPreset: Schema.string(),
 
   card: Schema.object({
     name: Schema.string().default('dsh-harness'),
